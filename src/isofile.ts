@@ -1047,13 +1047,30 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     this.stream.logBufferLevel(true);
   }
 
+  /* Returns the sample numbers of the track ordered by composition time (cts).
+     Samples are stored in decoding order, so with B-frames the display order
+     differs. The index is cached and rebuilt when samples are appended (e.g.
+     fragmented files fetched progressively). */
+  getSamplesInCompositionOrder(trak: trakBox): Array<number> {
+    if (
+      !trak.samplesCompositionOrder ||
+      trak.samplesCompositionOrder.length !== trak.samples.length
+    ) {
+      trak.samplesCompositionOrder = trak.samples
+        .map((sample, number) => number)
+        .sort((a, b) => {
+          const ctsDiff = trak.samples[a].cts - trak.samples[b].cts;
+          if (ctsDiff !== 0) return ctsDiff;
+          // samples sharing a composition time remain in decoding order
+          return a - b;
+        });
+    }
+    return trak.samplesCompositionOrder;
+  }
+
   /* Finds the byte offset for a given time on a given track
      also returns the time of the previous rap */
   seekTrack(time: number, useRap: boolean, trak: trakBox) {
-    let rap_seek_sample_num = 0;
-    let seek_sample_num = 0;
-    let timescale: number;
-
     if (trak.samples.length === 0) {
       Log.info(
         'ISOFile',
@@ -1065,35 +1082,80 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
       return { offset: 0, time: 0 };
     }
 
-    for (let j = 0; j < trak.samples.length; j++) {
-      const sample = trak.samples[j];
-      if (j === 0) {
-        seek_sample_num = 0;
-        timescale = sample.timescale;
-      } else if (sample.cts > time * sample.timescale) {
-        seek_sample_num = j - 1;
+    const timescale = trak.samples[0].timescale;
+    const targetTime = time * timescale;
+
+    /* Locate the sample whose display interval contains the target time:
+       the last sample in composition order with a cts not greater than the
+       target time. Samples are stored in decoding order, which differs from
+       display order when the track uses B-frames. */
+    const compositionOrder = this.getSamplesInCompositionOrder(trak);
+    const firstDisplayed = compositionOrder[0];
+    const lastDisplayed = compositionOrder[compositionOrder.length - 1];
+    let seek_sample_num: number;
+    if (trak.samples[lastDisplayed].cts <= targetTime) {
+      /* The target time is at or beyond the last displayed sample. The old
+         linear scan initialized the result to the first sample and never
+         updated it once every cts was below the target, so keep that result
+         to preserve the established behavior for out-of-range seeks. */
+      seek_sample_num = firstDisplayed;
+    } else if (trak.samples[firstDisplayed].cts > targetTime) {
+      /* Target time is before the first displayed sample: seek to the first
+         sample, matching the behavior of a linear scan over the samples. */
+      seek_sample_num = firstDisplayed;
+    } else {
+      seek_sample_num = firstDisplayed;
+      let low = 0;
+      let high = compositionOrder.length - 1;
+      while (low <= high) {
+        const middle = (low + high) >> 1;
+        const sample_num = compositionOrder[middle];
+        if (trak.samples[sample_num].cts <= targetTime) {
+          seek_sample_num = sample_num;
+          low = middle + 1;
+        } else {
+          high = middle - 1;
+        }
+      }
+    }
+
+    /* When a random access point is requested, move to the closest sync sample
+       that has to be decoded before the target sample. Sync samples are looked
+       up in decoding order (the sample array order), not display order: with
+       B-frames the sync sample displayed just before the target may actually be
+       decoded after it and would not make the target decodable. */
+    if (useRap) {
+      let rap_sample_num = seek_sample_num;
+      while (rap_sample_num > 0 && !trak.samples[rap_sample_num].is_sync) {
+        rap_sample_num--;
+      }
+      seek_sample_num = rap_sample_num;
+    }
+
+    /* Compute the byte offset to start downloading from. It must be early
+       enough that every sample of the decoding chain (from the sync sample up
+       to the located sample, in decoding order) can be fetched. Starting from
+       the first sample of that chain, skip samples whose data is already fully
+       downloaded, exactly like the previous linear implementation did: with a
+       fully buffered file this walks to the end of the track, while with a
+       partial download it stops at the first sample still missing data. For
+       tracks without B-frames the chain starts at the located sample itself,
+       so the resulting offset is unchanged compared to the old behavior. */
+    let offset_sample_num = seek_sample_num;
+    while (offset_sample_num < trak.samples.length - 1) {
+      const current = trak.samples[offset_sample_num];
+      if (current.alreadyRead !== current.size) {
         break;
       }
-      if (useRap && sample.is_sync) {
-        rap_seek_sample_num = j;
-      }
+      offset_sample_num++;
     }
-    if (useRap) {
-      seek_sample_num = rap_seek_sample_num;
-    }
-    time = trak.samples[seek_sample_num].cts;
+
+    const seek_time = trak.samples[seek_sample_num].cts;
     trak.nextSample = seek_sample_num;
     this.resetFragmentedTrackStateAfterSeek(trak, seek_sample_num);
     this.resetExtractedTrackStateAfterSeek(trak);
-    while (trak.samples[seek_sample_num].alreadyRead === trak.samples[seek_sample_num].size) {
-      // No remaining samples to look for, all are downloaded.
-      if (!trak.samples[seek_sample_num + 1]) {
-        break;
-      }
-      seek_sample_num++;
-    }
     const seek_offset =
-      trak.samples[seek_sample_num].offset + trak.samples[seek_sample_num].alreadyRead;
+      trak.samples[offset_sample_num].offset + trak.samples[offset_sample_num].alreadyRead;
     Log.info(
       'ISOFile',
       'Seeking to ' +
@@ -1103,11 +1165,11 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
         ' on track ' +
         trak.tkhd.track_id +
         ', time ' +
-        Log.getDurationString(time, timescale) +
+        Log.getDurationString(seek_time, timescale) +
         ' and offset: ' +
         seek_offset,
     );
-    return { offset: seek_offset, time: time / timescale };
+    return { offset: seek_offset, time: seek_time / timescale };
   }
 
   resetFragmentedTrackStateAfterSeek(trak: trakBox, seekSampleNumber: number) {
@@ -1662,6 +1724,7 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     let last_sample_in_chunk: number;
 
     trak.samples = [];
+    trak.samplesCompositionOrder = undefined;
     trak.samples_duration = 0;
     trak.samples_size = 0;
 

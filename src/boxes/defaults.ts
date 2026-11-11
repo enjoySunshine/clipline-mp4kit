@@ -145,6 +145,12 @@ export class trakBox extends ContainerBox {
   udtas: Array<udtaBox>;
   samples_duration: number;
   samples: Array<Sample> = [];
+  /**
+   * Sample numbers (indexes in {@link samples}) ordered by composition time (cts),
+   * i.e. the order in which samples are displayed. The sample array itself stays in
+   * decoding order. Rebuilt lazily by seek-related code when samples are appended.
+   */
+  samplesCompositionOrder?: Array<number>;
   samples_size: number;
   nextSample: number;
   lastValidSample: number;
